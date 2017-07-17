@@ -13,7 +13,7 @@ import sys
 import numpy as np
 
 from madmom.processors import (Processor, OnlineProcessor, SequentialProcessor,
-                               ParallelProcessor)
+                               ParallelProcessor, BufferProcessor)
 from madmom.audio.signal import smooth as smooth_signal
 from madmom.ml.nn import average_predictions
 
@@ -391,7 +391,7 @@ def detect_beats(activations, interval, look_aside=0.2):
 
 
 # classes for detecting/tracking of beat inside a beat activation function
-class BeatTrackingProcessor(Processor):
+class BeatTrackingProcessor(OnlineProcessor):
     """
     Track the beats according to previously determined (local) tempo by
     iteratively aligning them around the estimated position [1]_.
@@ -462,29 +462,44 @@ class BeatTrackingProcessor(Processor):
     """
     LOOK_ASIDE = 0.2
     LOOK_AHEAD = 10
-    # tempo defaults
-    MIN_BPM = 40
-    MAX_BPM = 240
-    ACT_SMOOTH = 0.09
-    HIST_SMOOTH = 7
-    ALPHA = 0.79
+    THRESHOLD = 0.1
+    BUFFER_SIZE = 5.
 
-    def __init__(self, look_aside=LOOK_ASIDE, look_ahead=LOOK_AHEAD, fps=None,
-                 tempo_estimator=None, **kwargs):
+    def __init__(self, look_aside=LOOK_ASIDE, look_ahead=LOOK_AHEAD,
+                 threshold=THRESHOLD, buffer_size=BUFFER_SIZE, fps=None,
+                 tempo_estimator=None, online=False, **kwargs):
+        # pylint: disable=unused-argument
+        super(BeatTrackingProcessor, self).__init__(online=online)
         # save variables
         self.look_aside = look_aside
         self.look_ahead = look_ahead
+        self.threshold = threshold
         self.fps = fps
         # tempo estimator
         if tempo_estimator is None:
             # import the TempoEstimation here otherwise we have a loop
             from .tempo import CombFilterTempoEstimationProcessor
-            # create default trempo estimator
+            # create default tempo estimator
             tempo_estimator = CombFilterTempoEstimationProcessor(fps=fps,
+                                                                 online=online,
                                                                  **kwargs)
         self.tempo_estimator = tempo_estimator
+        if self.online:
+            self.visualize = kwargs.get('verbose', False)
+            self.buffer = BufferProcessor(int(buffer_size * self.fps))
+            self.counter = 0
+            self.beat_counter = 0
+            self.last_beat = 0
 
-    def process(self, activations, **kwargs):
+    def reset(self):
+        """Reset the BeatTrackingProcessor."""
+        self.tempo_estimator.reset()
+        self.buffer.reset()
+        self.counter = 0
+        self.beat_counter = 0
+        self.last_beat = 0
+
+    def process_offline(self, activations, **kwargs):
         """
         Detect the beats in the given activation function.
 
@@ -553,6 +568,72 @@ class BeatTrackingProcessor(Processor):
         detections = np.array(detections) / float(self.fps)
         # remove beats with negative times and return them
         return detections[np.searchsorted(detections, 0):]
+
+    def process_online(self, activations, reset=True, **kwargs):
+        """
+        Detect the beats in the given activation function for online mode.
+
+        Parameters
+        ----------
+        activations : numpy array
+            Beat activation function.
+        reset : bool, optional
+            Reset the BeatTrackingProcessor to its initial state before
+            processing.
+
+        Returns
+        -------
+        beats : numpy array
+            Detected beat positions [seconds].
+
+        """
+        # reset to initial state
+        if reset:
+            self.reset()
+        beats_ = []
+        for activation in activations:
+            # shift buffer and put new activation at end of buffer
+            buffer = self.buffer(activation)
+            # create an online interval histogram
+            histogram = self.tempo_estimator.online_interval_histogram(
+                activation, reset=False)
+            # get the dominant interval
+            interval = self.tempo_estimator.dominant_interval(histogram)
+            # compute the current and the next possible beat time
+            cur_beat = self.counter / float(self.fps)
+            next_beat = self.last_beat + 60. / self.tempo_estimator.max_bpm
+            # only detect beats again after at least min_interval frames
+            detections = []
+            if cur_beat >= next_beat:
+                detections = detect_beats(buffer, interval, self.look_aside)
+            # if a detection falls within the last few frames and exceeds a
+            # certain threshold a beat was detected. this is important because
+            # for every frame the tempo may change and therefore the last beat
+            # can easily be missed.
+            if len(detections) > 0 and detections[-1] >= len(buffer) - 5 and \
+               buffer[detections[-1]] > self.threshold:
+                # append to beats
+                beats_.append(cur_beat)
+                # update last beat
+                self.last_beat = cur_beat
+            # visualize beats
+            if self.visualize:
+                display = ['']
+                if len(beats_) > 0 and beats_[-1] == cur_beat:
+                    self.beat_counter = 5
+                if self.beat_counter > 0:
+                    display.append('| X ')
+                else:
+                    display.append('|   ')
+                self.beat_counter -= 1
+                # display tempo
+                display.append('| %5.1f | ' % float(self.fps * 60 / interval))
+                sys.stderr.write('\r%s' % ''.join(display))
+                sys.stderr.flush()
+            # increase counter
+            self.counter += 1
+        # return beat(s)
+        return np.array(beats_)
 
     @staticmethod
     def add_arguments(parser, look_aside=LOOK_ASIDE,
